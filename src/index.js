@@ -38,26 +38,100 @@ export class MyContainer extends Container {
   sleepAfter = "10s"
 
   envVars = {
-    TELEGRAM_API_ID: env.TELEGRAM_API_ID,
-    TELEGRAM_API_HASH: env.TELEGRAM_API_HASH,
-    TELEGRAM_SESSION_STR: env.TELEGRAM_SESSION_STR,
     TIMESCALE_CONNECTION: env.TIMESCALE_CONNECTION,
   }
 }
 
-export default {
-  async scheduled(ctx, env) {
+/**
+ * Parses account configurations from environment variables.
+ * Supports both multi-account (ACCOUNTS_CONFIG JSON) and single account (legacy env vars).
+ * @param {Env} env - Cloudflare environment variables
+ * @returns {Array<Object>} Array of account configurations
+ */
+function getAccountConfigs(env) {
+  if (env.ACCOUNTS_CONFIG) {
     try {
-      const url = "https://example.com/"
-      const containerInstance = getContainer(env.CONTAINER, "theOnlyOne")
-      console.log("Container instance created")
-
-      await containerInstance.fetch(url)
-      return new Response("Success", { status: 200 })
-      
+      const accounts = JSON.parse(env.ACCOUNTS_CONFIG)
+      if (Array.isArray(accounts) && accounts.length > 0) {
+        console.log(`INFO: Found ${accounts.length} account(s) in ACCOUNTS_CONFIG`)
+        return accounts
+      }
     } catch (e) {
-      console.error("Error in scheduled handler:", e)
-      return new Response(e.message, { status: 500 })
+      console.error(`ERROR: Failed to parse ACCOUNTS_CONFIG: ${e.message}`)
     }
+  }
+
+  if (env.TELEGRAM_API_ID && env.TELEGRAM_API_HASH && env.TELEGRAM_SESSION_STR) {
+    console.log("INFO: Using legacy single account configuration")
+    return [{
+      accountId: env.TELEGRAM_API_ID,
+      apiId: env.TELEGRAM_API_ID,
+      apiHash: env.TELEGRAM_API_HASH,
+      sessionStr: env.TELEGRAM_SESSION_STR,
+    }]
+  }
+
+  throw new Error("No account configuration found. Provide either ACCOUNTS_CONFIG or legacy TELEGRAM_* env vars")
+}
+
+async function processAccounts(env) {
+  try {
+    const accountConfigs = getAccountConfigs(env)
+    const results = []
+
+    for (const account of accountConfigs) {
+      try {
+        const accountId = account.accountId || account.apiId
+        console.log(`INFO: Processing account ${accountId}`)
+
+        const containerInstance = getContainer(env.CONTAINER, accountId)
+        const requestBody = JSON.stringify({
+          accountId: account.accountId || account.apiId,
+          apiId: account.apiId,
+          apiHash: account.apiHash,
+          sessionStr: account.sessionStr,
+        })
+
+        const request = new Request("https://example.com/", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: requestBody,
+        })
+
+        const response = await containerInstance.fetch(request)
+        const responseText = await response.text()
+
+        if (response.ok) {
+          console.log(`INFO: Account ${accountId} processed successfully`)
+          results.push({ accountId, status: "success" })
+        } else {
+          console.error(`ERROR: Account ${accountId} failed with status ${response.status}: ${responseText}`)
+          results.push({ accountId, status: "error", error: responseText })
+        }
+      } catch (accountError) {
+        console.error(`ERROR: Failed to process account ${account.accountId || account.apiId}: ${accountError.message}`)
+        results.push({ accountId: account.accountId || account.apiId, status: "error", error: accountError.message })
+      }
+    }
+
+    const successCount = results.filter(r => r.status === "success").length
+    const totalCount = results.length
+
+    return new Response(
+      JSON.stringify({ message: `Processed ${successCount}/${totalCount} accounts`, results }),
+      { status: successCount === totalCount ? 200 : 207, headers: { "Content-Type": "application/json" } }
+    )
+  } catch (e) {
+    console.error(`ERROR: Error processing accounts: ${e.message}`)
+    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } })
+  }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    return await processAccounts(env)
+  },
+  async scheduled(ctx, env) {
+    return await processAccounts(env)
   },
 }

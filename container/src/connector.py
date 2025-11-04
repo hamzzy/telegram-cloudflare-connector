@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from asyncio import get_event_loop
 from urllib import request
 import os
@@ -22,12 +23,17 @@ class TelegramConnector:
     def __init__(
         self,
         timescale: TimescaleClient,
-        telegram: TelegramClient
+        telegram: TelegramClient,
+        account_id: str = None,
+        max_execution_time: int = 25
     ):
         self.event_loop = get_event_loop()
 
         self.timescale = timescale
         self.telegram = telegram
+        self.account_id = account_id or str(telegram.api_id)
+        self.max_execution_time = max_execution_time
+        self.start_time = time.time()
 
         current_dir = os.path.realpath(__file__)
         current_dir = os.path.dirname(current_dir)
@@ -36,16 +42,23 @@ class TelegramConnector:
         with open(schema_file_path) as schema_file:
             self.schema = json.loads(schema_file.read())
 
+    def _check_timeout(self):
+        elapsed = time.time() - self.start_time
+        if elapsed >= self.max_execution_time:
+            logging.warning(f"Execution time limit reached ({elapsed:.1f}s). Stopping channel processing.")
+            return True
+        return False
+
     def _get_last_msg_ids(self):
         sql = """
         SELECT DISTINCT source_channel_id AS channel_id, MAX(CAST(platform_message_id AS INTEGER)) as last_msg_id
         FROM message_feed
-        WHERE platform_name = 'telegram'
+        WHERE platform_name = 'telegram' AND source_account_id = %s
         GROUP BY source_channel_id;
         """
         try:
             with self.timescale.connection.cursor() as cur:
-                cur.execute(sql)
+                cur.execute(sql, (self.account_id,))
                 rows = cur.fetchall()
 
             if not rows:
@@ -167,7 +180,7 @@ class TelegramConnector:
                 "message": {"id": message_id, "text": message_text},
                 "user": {"id": source_user_id, "name": source_user_name},
                 "source": {
-                    "account_id": str(self.telegram.api_id),
+                    "account_id": self.account_id,
                     "platform": "telegram",
                     "channel": {"id": str(dialog_entity.id), "name": dialog_entity.title},
                 },
@@ -207,8 +220,9 @@ class TelegramConnector:
         for message in messages:
             user_id = message["user"]["id"]
             channel_id = message["source"]["channel"]["id"]
+            account_id = message["source"]["account_id"]
             referenced_post_id = message["source"].get("referenced_post", {}).get("id", "")
-            key = (user_id, channel_id, referenced_post_id)
+            key = (account_id, user_id, channel_id, referenced_post_id)
 
             if key not in user_messages:
                 user_messages[key] = []
@@ -246,8 +260,13 @@ class TelegramConnector:
     async def _get_channel_messages(self):
         channel_messages = []
         last_msg_ids = self._get_last_msg_ids()
+        processed_channels = 0
 
         async for dialog in self.telegram.iter_dialogs(archived=False):
+            if self._check_timeout():
+                logging.info(f"Timeout reached. Processed {processed_channels} channels, stopping.")
+                break
+
             try:
                 # Skip user chats
                 if dialog.is_user:
@@ -279,8 +298,12 @@ class TelegramConnector:
 
                 # Process messages in ascending order
                 for item in reversed(history.messages):
+                    if self._check_timeout():
+                        break
                     message = await self._process_dialog_message(entity, item)
                     message and channel_messages.append(message)
+
+                processed_channels += 1
 
             except Exception as err:
                 logging.info(f"Something went wrong: {str(err)}")
@@ -292,9 +315,12 @@ class TelegramConnector:
         logging.info(f"Found {len(channel_messages)} messages, compressed to {len(glued_messages)} messages")
 
         if not glued_messages:
+            logging.info("No messages to insert after gluing.")
             return
         
+        logging.info(f"Inserting {len(glued_messages)} messages into database...")
         self.timescale.insert_messages_batch(glued_messages)
+        logging.info(f"Successfully processed {processed_channels} channels in {time.time() - self.start_time:.1f}s")
 
     async def _start(self):
         if not self.telegram.is_connected():
