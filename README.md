@@ -5,6 +5,14 @@ This service runs on Cloudflare Workers with containers. It periodically retriev
 
 Use queries below to set up schema.
 
+**Note for existing databases:** If you have an existing database, you'll need to migrate the constraint:
+```sql
+ALTER TABLE message_feed 
+DROP CONSTRAINT IF EXISTS message_feed_timestamp_platform_name_platform_message_id_unique,
+ADD CONSTRAINT message_feed_timestamp_platform_name_platform_message_id_source_account_id_unique 
+UNIQUE(timestamp, platform_name, platform_message_id, source_account_id);
+```
+
 ```sql
 CREATE TABLE IF NOT EXISTS "message_feed" (
 	"id" integer GENERATED ALWAYS AS IDENTITY (sequence name "message_feed_id_seq" INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START WITH 1 CACHE 1),
@@ -20,7 +28,7 @@ CREATE TABLE IF NOT EXISTS "message_feed" (
 	"platform_specific" jsonb,
 	"message_id" integer NOT NULL,
 	CONSTRAINT "message_feed_id_timestamp_pk" PRIMARY KEY("id","timestamp"),
-	CONSTRAINT "message_feed_timestamp_platform_name_platform_message_id_unique" UNIQUE("timestamp","platform_name","platform_message_id")
+	CONSTRAINT "message_feed_timestamp_platform_name_platform_message_id_source_account_id_unique" UNIQUE("timestamp","platform_name","platform_message_id","source_account_id")
 );
 --> statement-breakpoint
 CREATE TABLE IF NOT EXISTS "unique_messages" (
