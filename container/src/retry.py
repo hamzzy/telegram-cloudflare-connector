@@ -19,16 +19,26 @@ T = TypeVar('T')
 logger = logging.getLogger(__name__)
 
 
-def _extract_wait_time(error_message: str) -> Optional[float]:
-    """Extract wait time from rate limit error messages."""
+def _extract_wait_time(exception: Exception) -> Optional[float]:
+    """Extract wait time from rate limit error messages or exception attributes."""
+    # Check if exception has seconds attribute (Telethon FloodWaitError)
+    if hasattr(exception, 'seconds'):
+        wait_seconds = float(exception.seconds)
+        # Add small buffer
+        return wait_seconds + 1
+    
+    # Check error message for patterns
+    error_message = str(exception).lower()
     patterns = [
         r'wait\s+(\d+)\s+seconds?',
         r'floodwait\s+(\d+)',
         r'(\d+)\s+seconds?',
+        r'flood.*wait.*?(\d+)',
+        r'rate.*limit.*?(\d+)',
     ]
     
     for pattern in patterns:
-        match = re.search(pattern, error_message.lower())
+        match = re.search(pattern, error_message)
         if match:
             wait_seconds = int(match.group(1))
             # Add small buffer
@@ -118,7 +128,7 @@ def retry_with_backoff(
         except Exception as e:
             error_type = classify_error(e)
             if error_type == ErrorType.RATE_LIMIT:
-                wait_time = _extract_wait_time(str(e))
+                wait_time = _extract_wait_time(e)
                 if wait_time:
                     raise RateLimitError(str(e), wait_time)
             raise
@@ -132,7 +142,7 @@ def retry_with_backoff(
                 except Exception as e:
                     error_type = classify_error(e)
                     if error_type == ErrorType.RATE_LIMIT:
-                        wait_time = _extract_wait_time(str(e))
+                        wait_time = _extract_wait_time(e)
                         if wait_time:
                             raise RateLimitError(str(e), wait_time)
                     raise

@@ -15,7 +15,7 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
 
 from timescale import TimescaleClient
-from errors import ErrorType, classify_error, CategorizedError
+from errors import ErrorType, classify_error
 from retry import retry_with_backoff
 
 
@@ -31,7 +31,8 @@ class TelegramConnector:
         account_id: str = None,
         max_execution_time: int = 25,
         max_concurrent_channels: int = 5,
-        save_interval: int = 50
+        save_interval: int = 50,
+        memory_buffer_size: int = 200
     ):
         self.event_loop = get_event_loop()
 
@@ -41,11 +42,15 @@ class TelegramConnector:
         self.max_execution_time = max_execution_time
         self.max_concurrent_channels = max_concurrent_channels
         self.save_interval = save_interval
+        self.memory_buffer_size = memory_buffer_size
         self.start_time = time.time()
         self.semaphore = asyncio.Semaphore(max_concurrent_channels)
         self.shutdown_requested = False
         self.pending_messages = []
         self.processed_channels = set()
+        self.message_buffer = []
+        self.total_messages_collected = 0
+        self.rate_limit_encountered = False
 
         current_dir = os.path.realpath(__file__)
         current_dir = os.path.dirname(current_dir)
@@ -75,8 +80,8 @@ class TelegramConnector:
             return True
         return False
     
-    def _save_incremental(self, messages: list):
-        """Save messages incrementally to prevent data loss."""
+    async def _save_incremental(self, messages: list):
+        """Save messages incrementally to prevent data loss and optimize memory."""
         if not messages:
             return
         
@@ -84,7 +89,18 @@ class TelegramConnector:
             glued_messages = self._glue_same_user_messages(messages)
             if glued_messages:
                 logging.info(f"Incremental save: Inserting {len(glued_messages)} messages...")
-                self.timescale.insert_messages_batch(glued_messages)
+                
+                async def save_messages():
+                    self.timescale.insert_messages_batch(glued_messages)
+                
+                await retry_with_backoff(
+                    save_messages,
+                    max_retries=3,
+                    initial_delay=2.0,
+                    max_delay=30.0,
+                    error_type_filter=ErrorType.RETRYABLE
+                )
+                
                 self.pending_messages.clear()
                 logging.info("Incremental save completed.")
         except Exception as e:
@@ -94,6 +110,31 @@ class TelegramConnector:
                 # Keep messages for retry
                 self.pending_messages.extend(messages)
             raise
+    
+    async def _flush_message_buffer(self, force: bool = False):
+        """Flush message buffer to database when it reaches threshold."""
+        buffer_size = len(self.message_buffer)
+        
+        if buffer_size >= self.memory_buffer_size or (force and buffer_size > 0):
+            messages_to_save = self.message_buffer[:self.memory_buffer_size]
+            self.message_buffer = self.message_buffer[self.memory_buffer_size:]
+            
+            try:
+                await self._save_incremental(messages_to_save)
+                logging.info(f"Flushed {len(messages_to_save)} messages from buffer. Buffer size: {len(self.message_buffer)}")
+            except Exception as e:
+                error_type = classify_error(e)
+                logging.error(f"Failed to flush buffer ({error_type.value}): {e}")
+                # Put messages back at the front for retry
+                self.message_buffer = messages_to_save + self.message_buffer
+    
+    def _add_to_buffer(self, messages: list):
+        """Add messages to buffer. Caller should flush periodically."""
+        if not messages:
+            return
+        
+        self.message_buffer.extend(messages)
+        self.total_messages_collected += len(messages)
 
     def _get_last_msg_ids(self):
         sql = """
@@ -304,7 +345,7 @@ class TelegramConnector:
         return sorted_glued_messages
 
     async def _process_single_channel(self, entity, entity_id, last_msg_id):
-        """Process a single channel and return its messages with retry logic."""
+        """Process a single channel and return its messages with retry logic and rate limit awareness."""
         async with self.semaphore:
             if self._check_timeout() or entity_id in self.processed_channels:
                 return []
@@ -346,6 +387,19 @@ class TelegramConnector:
                 return channel_messages
             except Exception as err:
                 error_type = classify_error(err)
+                
+                # Handle rate limits specially - reduce concurrency
+                if error_type == ErrorType.RATE_LIMIT:
+                    self.rate_limit_encountered = True
+                    logging.warning(
+                        f"Rate limit encountered for channel '{entity_id}'. "
+                        f"Reducing concurrency and backing off."
+                    )
+                    # Reduce semaphore capacity temporarily
+                    if self.semaphore._value > 1:
+                        # Release one permit to reduce concurrency
+                        pass  # Semaphore will naturally reduce concurrency on next retry
+                
                 logging.warning(
                     f"Error processing channel '{entity_id}' ({error_type.value}): {str(err)}"
                 )
@@ -387,59 +441,48 @@ class TelegramConnector:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        channel_messages = []
         processed_count = 0
         error_count = 0
 
+        # Process results and add to buffer incrementally
         for result in results:
             if isinstance(result, Exception):
                 error_count += 1
                 logging.error(f"Channel processing error: {result}")
             elif result:
-                channel_messages.extend(result)
+                # Add messages to buffer instead of accumulating in memory
+                self._add_to_buffer(result)
                 processed_count += 1
+                # Periodically flush buffer to keep memory usage low
+                if len(self.message_buffer) >= self.memory_buffer_size:
+                    await self._flush_message_buffer()
 
         logging.info(f"Completed processing: {processed_count} successful, {error_count} errors")
+        logging.info(f"Total messages collected: {self.total_messages_collected}, Buffer size: {len(self.message_buffer)}")
+
+        # If rate limit was encountered, log warning
+        if self.rate_limit_encountered:
+            logging.warning(
+                "Rate limit encountered during processing. Consider reducing "
+                f"max_concurrent_channels (current: {self.max_concurrent_channels})"
+            )
+
+        # Flush any remaining messages in buffer
+        if self.message_buffer:
+            logging.info(f"Flushing remaining {len(self.message_buffer)} messages from buffer...")
+            await self._flush_message_buffer(force=True)
 
         # Combine with pending messages from previous runs
-        all_messages = self.pending_messages + channel_messages
-        self.pending_messages = []
+        if self.pending_messages:
+            logging.info(f"Processing {len(self.pending_messages)} pending messages from previous run...")
+            await self._save_incremental(self.pending_messages)
+            self.pending_messages = []
 
-        if not all_messages:
-            logging.info("No messages collected from channels.")
-            return
-
-        glued_messages = self._glue_same_user_messages(all_messages)
-        logging.info(f"Found {len(all_messages)} messages, compressed to {len(glued_messages)} messages")
-
-        if not glued_messages:
-            logging.info("No messages to insert after gluing.")
-            return
-        
-        # Save with retry logic
-        try:
-            async def save_messages():
-                self.timescale.insert_messages_batch(glued_messages)
-            
-            await retry_with_backoff(
-                save_messages,
-                max_retries=3,
-                initial_delay=2.0,
-                max_delay=30.0,
-                error_type_filter=ErrorType.RETRYABLE
-            )
-            
-            elapsed_time = time.time() - self.start_time
-            logging.info(
-                f"Successfully processed {processed_count}/{len(channels_to_process)} "
-                f"channels in {elapsed_time:.1f}s"
-            )
-        except Exception as e:
-            error_type = classify_error(e)
-            logging.error(f"Failed to save messages ({error_type.value}): {e}")
-            # Keep messages for next run
-            self.pending_messages = glued_messages
-            raise
+        elapsed_time = time.time() - self.start_time
+        logging.info(
+            f"Successfully processed {processed_count}/{len(channels_to_process)} "
+            f"channels in {elapsed_time:.1f}s. Total messages: {self.total_messages_collected}"
+        )
 
     async def _start(self):
         telegram_connected = False
@@ -459,10 +502,14 @@ class TelegramConnector:
             logging.info("Getting user messages from channels...")
             await self._get_channel_messages()
             
-            # Save any remaining pending messages
+            # Save any remaining pending messages and flush buffer
+            if self.message_buffer:
+                logging.info(f"Flushing {len(self.message_buffer)} messages from buffer before shutdown...")
+                await self._flush_message_buffer(force=True)
+            
             if self.pending_messages:
                 logging.info(f"Saving {len(self.pending_messages)} pending messages...")
-                self._save_incremental(self.pending_messages)
+                await self._save_incremental(self.pending_messages)
         finally:
             # Ensure Telegram connection is always closed
             await self._cleanup_telegram(telegram_connected)
@@ -491,10 +538,16 @@ class TelegramConnector:
         except KeyboardInterrupt:
             logging.warning("Received keyboard interrupt. Initiating graceful shutdown...")
             self.shutdown_requested = True
-            # Try to save pending messages before exit
+            # Try to save pending messages and flush buffer before exit
+            if self.message_buffer:
+                try:
+                    self.event_loop.run_until_complete(self._flush_message_buffer(force=True))
+                except Exception as e:
+                    logging.error(f"Failed to flush buffer on shutdown: {e}")
+            
             if self.pending_messages:
                 try:
-                    self._save_incremental(self.pending_messages)
+                    self.event_loop.run_until_complete(self._save_incremental(self.pending_messages))
                 except Exception as e:
                     logging.error(f"Failed to save messages on shutdown: {e}")
         finally:

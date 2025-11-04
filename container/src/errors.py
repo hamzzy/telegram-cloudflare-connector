@@ -59,12 +59,21 @@ def classify_error(error: Exception) -> ErrorType:
         # Other DB errors might be fatal
         return ErrorType.FATAL
     
-    # Telegram API errors
+    # Telegram API errors - check for specific Telethon error types
     if "telethon" in error_type.lower() or "telegram" in error_str:
         if "auth" in error_str or "unauthorized" in error_str:
             return ErrorType.FATAL
-        if "flood" in error_str or "wait" in error_str:
+        if "flood" in error_str or "wait" in error_str or "floodwait" in error_str:
             return ErrorType.RATE_LIMIT
+    
+    # Check for Telethon FloodWaitError specifically
+    if error_type == "FloodWaitError":
+        return ErrorType.RATE_LIMIT
+    
+    # Check if error has floodwait attribute (Telethon error structure)
+    if hasattr(error, 'seconds'):
+        # Telethon FloodWaitError has 'seconds' attribute
+        return ErrorType.RATE_LIMIT
     
     # Validation errors are fatal
     if "validation" in error_str or "schema" in error_str:
