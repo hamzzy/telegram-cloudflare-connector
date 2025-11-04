@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+import asyncio
 from asyncio import get_event_loop
 from urllib import request
 import os
@@ -25,7 +26,8 @@ class TelegramConnector:
         timescale: TimescaleClient,
         telegram: TelegramClient,
         account_id: str = None,
-        max_execution_time: int = 25
+        max_execution_time: int = 25,
+        max_concurrent_channels: int = 5
     ):
         self.event_loop = get_event_loop()
 
@@ -33,7 +35,9 @@ class TelegramConnector:
         self.telegram = telegram
         self.account_id = account_id or str(telegram.api_id)
         self.max_execution_time = max_execution_time
+        self.max_concurrent_channels = max_concurrent_channels
         self.start_time = time.time()
+        self.semaphore = asyncio.Semaphore(max_concurrent_channels)
 
         current_dir = os.path.realpath(__file__)
         current_dir = os.path.dirname(current_dir)
@@ -257,32 +261,16 @@ class TelegramConnector:
         sorted_glued_messages = sorted(glued_messages, key=lambda x: x["timestamp"])
         return sorted_glued_messages
 
-    async def _get_channel_messages(self):
-        channel_messages = []
-        last_msg_ids = self._get_last_msg_ids()
-        processed_channels = 0
-
-        async for dialog in self.telegram.iter_dialogs(archived=False):
+    async def _process_single_channel(self, entity, entity_id, last_msg_id):
+        """Process a single channel and return its messages."""
+        async with self.semaphore:
             if self._check_timeout():
-                logging.info(f"Timeout reached. Processed {processed_channels} channels, stopping.")
-                break
-
+                return []
+            
             try:
-                # Skip user chats
-                if dialog.is_user:
-                    continue
-
-                entity = dialog.entity
-                entity_id = str(entity.id)
-
-                last_msg_id = last_msg_ids.get(entity_id, 0)
                 limit_value = 20 if last_msg_id == 0 else 0
+                logging.info(f"Obtaining chat history for '{entity_id}' - '{entity.title}'...")
                 
-                # Skip if the message is not newer than the last processed one
-                if dialog.message.id <= last_msg_id:
-                    continue
-
-                logging.info(f"Obtaining chat history for '{entity_id}' - '{dialog.name}'...")
                 history = await self.telegram(
                     GetHistoryRequest(
                         peer=entity,
@@ -296,19 +284,69 @@ class TelegramConnector:
                     )
                 )
 
-                # Process messages in ascending order
+                channel_messages = []
                 for item in reversed(history.messages):
                     if self._check_timeout():
                         break
                     message = await self._process_dialog_message(entity, item)
-                    message and channel_messages.append(message)
+                    if message:
+                        channel_messages.append(message)
 
-                processed_channels += 1
-
+                return channel_messages
             except Exception as err:
-                logging.info(f"Something went wrong: {str(err)}")
+                logging.info(f"Error processing channel '{entity_id}': {str(err)}")
+                return []
+
+    async def _get_channel_messages(self):
+        last_msg_ids = self._get_last_msg_ids()
+        channels_to_process = []
+
+        logging.info("Collecting channels to process...")
+        async for dialog in self.telegram.iter_dialogs(archived=False):
+            if self._check_timeout():
+                break
+
+            if dialog.is_user:
+                continue
+
+            entity = dialog.entity
+            entity_id = str(entity.id)
+            last_msg_id = last_msg_ids.get(entity_id, 0)
+
+            if dialog.message.id <= last_msg_id:
+                continue
+
+            channels_to_process.append((entity, entity_id, last_msg_id))
+
+        if not channels_to_process:
+            logging.info("No channels to process.")
+            return
+
+        logging.info(f"Processing {len(channels_to_process)} channels in parallel (max {self.max_concurrent_channels} concurrent)...")
+
+        tasks = [
+            self._process_single_channel(entity, entity_id, last_msg_id)
+            for entity, entity_id, last_msg_id in channels_to_process
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        channel_messages = []
+        processed_count = 0
+        error_count = 0
+
+        for result in results:
+            if isinstance(result, Exception):
+                error_count += 1
+                logging.error(f"Channel processing error: {result}")
+            elif result:
+                channel_messages.extend(result)
+                processed_count += 1
+
+        logging.info(f"Completed processing: {processed_count} successful, {error_count} errors")
 
         if not channel_messages:
+            logging.info("No messages collected from channels.")
             return
 
         glued_messages = self._glue_same_user_messages(channel_messages)
@@ -320,7 +358,8 @@ class TelegramConnector:
         
         logging.info(f"Inserting {len(glued_messages)} messages into database...")
         self.timescale.insert_messages_batch(glued_messages)
-        logging.info(f"Successfully processed {processed_channels} channels in {time.time() - self.start_time:.1f}s")
+        elapsed_time = time.time() - self.start_time
+        logging.info(f"Successfully processed {processed_count}/{len(channels_to_process)} channels in {elapsed_time:.1f}s")
 
     async def _start(self):
         if not self.telegram.is_connected():
