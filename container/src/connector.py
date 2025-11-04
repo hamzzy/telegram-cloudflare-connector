@@ -12,7 +12,7 @@ import jsonschema
 from jsonschema.exceptions import ValidationError, SchemaError
 from bs4 import BeautifulSoup
 from telethon import TelegramClient
-from telethon.tl.functions.messages import GetHistoryRequest
+from telethon.tl.functions.messages import GetHistoryRequest, GetRepliesRequest
 
 from timescale import TimescaleClient
 from errors import ErrorType, classify_error
@@ -43,6 +43,7 @@ class TelegramConnector:
         self.max_concurrent_channels = max_concurrent_channels
         self.save_interval = save_interval
         self.memory_buffer_size = memory_buffer_size
+        self.collect_comments = True
         self.start_time = time.time()
         self.semaphore = asyncio.Semaphore(max_concurrent_channels)
         self.shutdown_requested = False
@@ -137,13 +138,18 @@ class TelegramConnector:
         self.total_messages_collected += len(messages)
 
     def _get_last_msg_ids(self):
+        """Get last message ID per channel for posts."""
         sql = """
         SELECT DISTINCT source_channel_id AS channel_id, MAX(CAST(platform_message_id AS INTEGER)) as last_msg_id
         FROM message_feed
         WHERE platform_name = 'telegram' AND source_account_id = %s
+        AND platform_specific->>'referenced_post' IS NULL
         GROUP BY source_channel_id;
         """
         try:
+            if not self.timescale.connection or self.timescale.connection.closed:
+                self.timescale._connect()
+            
             with self.timescale.connection.cursor() as cur:
                 cur.execute(sql, (self.account_id,))
                 rows = cur.fetchall()
@@ -157,6 +163,30 @@ class TelegramConnector:
         except Exception as e:
             logging.error(f"Failed to fetch last message IDs: {e}")
             return {}
+    
+    def _get_last_comment_ids(self, post_id):
+        """Get last comment ID for a specific post."""
+        sql = """
+        SELECT MAX(CAST(platform_message_id AS INTEGER)) as last_comment_id
+        FROM message_feed
+        WHERE platform_name = 'telegram' 
+        AND source_account_id = %s
+        AND platform_specific->>'referenced_post_id' = %s;
+        """
+        try:
+            if not self.timescale.connection or self.timescale.connection.closed:
+                self.timescale._connect()
+            
+            with self.timescale.connection.cursor() as cur:
+                cur.execute(sql, (self.account_id, str(post_id)))
+                row = cur.fetchone()
+                
+            if row and row[0]:
+                return int(row[0])
+            return 0
+        except Exception as e:
+            logging.debug(f"Failed to fetch last comment ID for post {post_id}: {e}")
+            return 0
 
     def _get_file_url_from_web_preview(self, url: str, type: str):
         try:
@@ -235,7 +265,7 @@ class TelegramConnector:
 
         return media
 
-    async def _process_dialog_message(self, dialog_entity, message_item):
+    async def _process_dialog_message(self, dialog_entity, message_item, is_comment=False, parent_post_id=None):
         try:
             source_id = message_item.from_id or message_item.peer_id
 
@@ -273,8 +303,17 @@ class TelegramConnector:
                 },
             }
 
+            # Add referenced post if this is a comment
+            if is_comment and parent_post_id:
+                message_data["source"]["referenced_post"] = {"id": str(parent_post_id)}
+                if hasattr(dialog_entity, "username") and dialog_entity.username:
+                    message_data["source"]["referenced_post"]["url"] = f"https://t.me/{dialog_entity.username}/{parent_post_id}"
+                # Also store in platform_specific for database querying
+                message_data["platform_specific"]["referenced_post_id"] = str(parent_post_id)
+
             if hasattr(dialog_entity, "username") and dialog_entity.username:
-                message_data["message"]["url"] = f"https://t.me/{dialog_entity.username}"
+                if not is_comment:
+                    message_data["message"]["url"] = f"https://t.me/{dialog_entity.username}/{message_id}"
 
             if message_item.geo is not None:
                 message_data["geo_coords"] = {
@@ -299,6 +338,66 @@ class TelegramConnector:
             logging.error(f"Schema error: {schema_error}")
         except Exception as general_error:
             logging.info(f"The message is not valid: {general_error}. Skipping...")
+    
+    async def _fetch_post_comments(self, dialog_entity, post_id):
+        """Fetch comments for a channel post."""
+        try:
+            if self._check_timeout():
+                return []
+            
+            # Get last comment ID for this post to fetch only new comments
+            last_comment_id = self._get_last_comment_ids(post_id)
+            
+            # Skip if no new comments expected (only fetch if we're getting new posts)
+            if last_comment_id == 0:
+                # First time fetching - get all comments up to limit
+                limit_value = 100
+            else:
+                # Fetch only new comments
+                limit_value = 0
+            
+            async def fetch_replies():
+                return await self.telegram(
+                    GetRepliesRequest(
+                        peer=dialog_entity,
+                        msg_id=post_id,
+                        offset_id=0,
+                        offset_date=None,
+                        add_offset=0,
+                        limit=limit_value,
+                        max_id=0,
+                        min_id=last_comment_id,
+                        hash=0
+                    )
+                )
+            
+            replies = await retry_with_backoff(
+                fetch_replies,
+                max_retries=3,
+                initial_delay=1.0,
+                max_delay=60.0
+            )
+            
+            comment_messages = []
+            for item in reversed(replies.messages):
+                if self._check_timeout():
+                    break
+                comment = await self._process_dialog_message(
+                    dialog_entity, 
+                    item, 
+                    is_comment=True, 
+                    parent_post_id=post_id
+                )
+                if comment:
+                    comment_messages.append(comment)
+            
+            return comment_messages
+        except Exception as err:
+            error_type = classify_error(err)
+            # Some posts may not have comments enabled, which is fine
+            if error_type != ErrorType.FATAL:
+                logging.debug(f"Could not fetch comments for post {post_id}: {str(err)}")
+            return []
 
     def _glue_same_user_messages(self, messages: list):
         user_messages = {}
@@ -376,12 +475,42 @@ class TelegramConnector:
                 )
 
                 channel_messages = []
+                posts_with_comments = []
+                
                 for item in reversed(history.messages):
                     if self._check_timeout():
                         break
                     message = await self._process_dialog_message(entity, item)
                     if message:
                         channel_messages.append(message)
+                        # Check if post has comments/replies enabled
+                        if hasattr(item, 'replies') and item.replies:
+                            replies_info = item.replies
+                            if hasattr(replies_info, 'replies') and replies_info.replies > 0:
+                                posts_with_comments.append((item.id, message))
+
+                # Fetch comments for posts that have them (if enabled)
+                if self.collect_comments and posts_with_comments and not self._check_timeout():
+                    logging.info(f"Fetching comments for {len(posts_with_comments)} posts in '{entity.title}'...")
+                    comment_tasks = [
+                        self._fetch_post_comments(entity, post_id)
+                        for post_id, _ in posts_with_comments
+                    ]
+                    
+                    comment_results = await asyncio.gather(*comment_tasks, return_exceptions=True)
+                    
+                    comments_collected = 0
+                    for result in comment_results:
+                        if isinstance(result, Exception):
+                            error_type = classify_error(result)
+                            if error_type != ErrorType.FATAL:
+                                logging.debug(f"Error fetching comments: {result}")
+                        elif result:
+                            channel_messages.extend(result)
+                            comments_collected += len(result)
+                    
+                    if comments_collected > 0:
+                        logging.info(f"Collected {comments_collected} comments from {len(posts_with_comments)} posts")
 
                 self.processed_channels.add(entity_id)
                 return channel_messages
