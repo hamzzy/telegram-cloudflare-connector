@@ -20,7 +20,29 @@ class TimescaleClient:
             logging.error(f"Unable to connect to TimescaleDB: {e}")
             raise
 
-    def insert_messages_batch(self, messages: List[Dict]):
+    def insert_messages_batch(self, messages: List[Dict], batch_size: int = 1000):
+        """
+        Insert messages in batches to avoid memory issues and connection timeouts.
+        
+        Args:
+            messages: List of message dictionaries to insert
+            batch_size: Maximum number of messages to insert per batch
+        """
+        if not messages:
+            return
+
+        total_messages = len(messages)
+        logging.info(f"Inserting {total_messages} messages in batches of {batch_size}...")
+
+        for batch_start in range(0, total_messages, batch_size):
+            batch_end = min(batch_start + batch_size, total_messages)
+            batch = messages[batch_start:batch_end]
+            
+            logging.info(f"Processing batch {batch_start//batch_size + 1}: messages {batch_start+1}-{batch_end} of {total_messages}")
+            self._insert_batch(batch)
+
+    def _insert_batch(self, messages: List[Dict]):
+        """Insert a single batch of messages."""
         sql_insert_unique_messages = """
         INSERT INTO unique_messages (content, embedding)
         VALUES %s
@@ -39,8 +61,11 @@ class TimescaleClient:
             source_channel_id, platform_specific, message_id
         )
         VALUES %s
-        ON CONFLICT (timestamp, platform_name, platform_message_id) DO NOTHING;
+        ON CONFLICT (timestamp, platform_name, platform_message_id, source_account_id) DO NOTHING;
         """
+
+        if not self.connection or self.connection.closed:
+            self._connect()
 
         with self.connection.cursor() as cursor:
             try:
@@ -59,7 +84,7 @@ class TimescaleClient:
                 unique_message_map = dict(cursor.fetchall())
 
                 message_feed_values = []
-                failed_rows = [] # List to store any rows that fail
+                failed_rows = []
 
                 for msg in messages:
                     try:
@@ -91,23 +116,23 @@ class TimescaleClient:
                     execute_values(cursor, sql_insert_message_feed, message_feed_values)
 
                 self.connection.commit()
-                logging.info("Batch inserted unique messages and message feed.")
+                logging.info(f"Batch inserted {len(message_feed_values)} messages into message feed.")
 
                 if failed_rows:
                     logging.warning(
-                        f"Failed to process {len(failed_rows)} rows. Details: {failed_rows}"
+                        f"Failed to process {len(failed_rows)} rows in this batch."
                     )
 
             except Exception as e:
                 self.connection.rollback()
                 logging.error(f"Failed to batch insert messages: {e}")
-                
-            finally:
-                self.close()
+                raise
 
     def close(self):
-        if self.connection:
+        """Close the database connection. Should only be called when done with the client."""
+        if self.connection and not self.connection.closed:
             self.connection.close()
+            logging.info("Database connection closed.")
 
 
 def get_timescale_client():

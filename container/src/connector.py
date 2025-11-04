@@ -360,6 +360,14 @@ class TelegramConnector:
         self.timescale.insert_messages_batch(glued_messages)
         elapsed_time = time.time() - self.start_time
         logging.info(f"Successfully processed {processed_count}/{len(channels_to_process)} channels in {elapsed_time:.1f}s")
+        
+        # Cleanup Telegram connection
+        try:
+            if self.telegram.is_connected():
+                await self.telegram.disconnect()
+                logging.info("Telegram connection closed.")
+        except Exception as e:
+            logging.warning(f"Error closing Telegram connection: {e}")
 
     async def _start(self):
         if not self.telegram.is_connected():
@@ -370,7 +378,7 @@ class TelegramConnector:
             raise UserNotLoggedIn
 
         logging.info("Getting user messages from channels...")
-        messages = await self._get_channel_messages()
+        await self._get_channel_messages()
 
     def start(self):
         logging.info("Starting telegram connector...")

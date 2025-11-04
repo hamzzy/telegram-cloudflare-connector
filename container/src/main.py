@@ -32,10 +32,17 @@ def run_connector():
         telegram = get_telegram_client(api_id=api_id, api_hash=api_hash, session_str=session_str)
         timescale = get_timescale_client()
 
-        connector = TelegramConnector(timescale, telegram, account_id=account_id)
-        logging.info(f"TelegramConnector instance created for account {account_id}")
-        connector.start()
-        return jsonify({"status": "Connector finished", "accountId": account_id}), HTTPStatus.OK
+        try:
+            connector = TelegramConnector(timescale, telegram, account_id=account_id)
+            logging.info(f"TelegramConnector instance created for account {account_id}")
+            connector.start()
+            return jsonify({"status": "Connector finished", "accountId": account_id}), HTTPStatus.OK
+        finally:
+            try:
+                timescale.close()
+                logging.info("Database connection closed successfully")
+            except Exception as close_error:
+                logging.warning(f"Error closing database connection: {close_error}")
     except Exception as e:
         logging.error(f"Error in run_connector: {e}")
         return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
