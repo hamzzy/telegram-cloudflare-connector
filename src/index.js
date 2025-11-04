@@ -74,56 +74,113 @@ function getAccountConfigs(env) {
   throw new Error("No account configuration found. Provide either ACCOUNTS_CONFIG or legacy TELEGRAM_* env vars")
 }
 
+/**
+ * Processes a single account with timeout handling.
+ * @param {Object} account - Account configuration
+ * @param {Object} env - Cloudflare environment variables
+ * @param {number} timeoutMs - Request timeout in milliseconds (default: 30000)
+ * @returns {Promise<Object>} Result object with accountId and status
+ */
+async function processSingleAccount(account, env, timeoutMs = 30000) {
+  const accountId = account.accountId || account.apiId
+  console.log(`INFO: Processing account ${accountId}`)
+
+  try {
+    const containerInstance = getContainer(env.CONTAINER, accountId)
+    const requestBody = JSON.stringify({
+      accountId: account.accountId || account.apiId,
+      apiId: account.apiId,
+      apiHash: account.apiHash,
+      sessionStr: account.sessionStr,
+    })
+
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
+    try {
+      const request = new Request("https://example.com/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody,
+        signal: controller.signal,
+      })
+
+      const response = await containerInstance.fetch(request)
+      clearTimeout(timeoutId)
+      const responseText = await response.text()
+
+      if (response.ok) {
+        console.log(`INFO: Account ${accountId} processed successfully`)
+        return { accountId, status: "success" }
+      } else {
+        console.error(`ERROR: Account ${accountId} failed with status ${response.status}: ${responseText}`)
+        return { accountId, status: "error", error: responseText }
+      }
+    } catch (fetchError) {
+      clearTimeout(timeoutId)
+      if (fetchError.name === "AbortError") {
+        console.error(`ERROR: Account ${accountId} timed out after ${timeoutMs}ms`)
+        return { accountId, status: "error", error: `Request timeout after ${timeoutMs}ms` }
+      }
+      throw fetchError
+    }
+  } catch (accountError) {
+    console.error(`ERROR: Failed to process account ${accountId}: ${accountError.message}`)
+    return { accountId, status: "error", error: accountError.message }
+  }
+}
+
 async function processAccounts(env) {
   try {
     const accountConfigs = getAccountConfigs(env)
-    const results = []
-
-    for (const account of accountConfigs) {
-      try {
-        const accountId = account.accountId || account.apiId
-        console.log(`INFO: Processing account ${accountId}`)
-
-        const containerInstance = getContainer(env.CONTAINER, accountId)
-        const requestBody = JSON.stringify({
-          accountId: account.accountId || account.apiId,
-          apiId: account.apiId,
-          apiHash: account.apiHash,
-          sessionStr: account.sessionStr,
-        })
-
-        const request = new Request("https://example.com/", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: requestBody,
-        })
-
-        const response = await containerInstance.fetch(request)
-        const responseText = await response.text()
-
-        if (response.ok) {
-          console.log(`INFO: Account ${accountId} processed successfully`)
-          results.push({ accountId, status: "success" })
-        } else {
-          console.error(`ERROR: Account ${accountId} failed with status ${response.status}: ${responseText}`)
-          results.push({ accountId, status: "error", error: responseText })
-        }
-      } catch (accountError) {
-        console.error(`ERROR: Failed to process account ${account.accountId || account.apiId}: ${accountError.message}`)
-        results.push({ accountId: account.accountId || account.apiId, status: "error", error: accountError.message })
-      }
+    
+    if (accountConfigs.length === 0) {
+      return new Response(JSON.stringify({ error: "No accounts to process" }), { 
+        status: 400, 
+        headers: { "Content-Type": "application/json" } 
+      })
     }
 
-    const successCount = results.filter(r => r.status === "success").length
-    const totalCount = results.length
+    console.log(`INFO: Processing ${accountConfigs.length} account(s) in parallel...`)
+    
+    const accountPromises = accountConfigs.map(account => processSingleAccount(account, env))
+    const results = await Promise.allSettled(accountPromises)
+
+    const processedResults = results.map((result, index) => {
+      if (result.status === "fulfilled") {
+        return result.value
+      } else {
+        const accountId = accountConfigs[index].accountId || accountConfigs[index].apiId
+        console.error(`ERROR: Account ${accountId} promise rejected: ${result.reason}`)
+        return { 
+          accountId, 
+          status: "error", 
+          error: result.reason?.message || String(result.reason) 
+        }
+      }
+    })
+
+    const successCount = processedResults.filter(r => r.status === "success").length
+    const totalCount = processedResults.length
+
+    console.log(`INFO: Completed processing: ${successCount}/${totalCount} accounts succeeded`)
 
     return new Response(
-      JSON.stringify({ message: `Processed ${successCount}/${totalCount} accounts`, results }),
-      { status: successCount === totalCount ? 200 : 207, headers: { "Content-Type": "application/json" } }
+      JSON.stringify({ 
+        message: `Processed ${successCount}/${totalCount} accounts`, 
+        results: processedResults 
+      }),
+      { 
+        status: successCount === totalCount ? 200 : 207, 
+        headers: { "Content-Type": "application/json" } 
+      }
     )
   } catch (e) {
     console.error(`ERROR: Error processing accounts: ${e.message}`)
-    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } })
+    return new Response(JSON.stringify({ error: e.message }), { 
+      status: 500, 
+      headers: { "Content-Type": "application/json" } 
+    })
   }
 }
 

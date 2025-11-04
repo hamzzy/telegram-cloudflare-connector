@@ -2,6 +2,7 @@ import json
 import logging
 import time
 import asyncio
+import signal
 from asyncio import get_event_loop
 from urllib import request
 import os
@@ -14,6 +15,8 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
 
 from timescale import TimescaleClient
+from errors import ErrorType, classify_error, CategorizedError
+from retry import retry_with_backoff
 
 
 class UserNotLoggedIn(Exception):
@@ -27,7 +30,8 @@ class TelegramConnector:
         telegram: TelegramClient,
         account_id: str = None,
         max_execution_time: int = 25,
-        max_concurrent_channels: int = 5
+        max_concurrent_channels: int = 5,
+        save_interval: int = 50
     ):
         self.event_loop = get_event_loop()
 
@@ -36,8 +40,12 @@ class TelegramConnector:
         self.account_id = account_id or str(telegram.api_id)
         self.max_execution_time = max_execution_time
         self.max_concurrent_channels = max_concurrent_channels
+        self.save_interval = save_interval
         self.start_time = time.time()
         self.semaphore = asyncio.Semaphore(max_concurrent_channels)
+        self.shutdown_requested = False
+        self.pending_messages = []
+        self.processed_channels = set()
 
         current_dir = os.path.realpath(__file__)
         current_dir = os.path.dirname(current_dir)
@@ -45,13 +53,47 @@ class TelegramConnector:
 
         with open(schema_file_path) as schema_file:
             self.schema = json.loads(schema_file.read())
+        
+        self._setup_signal_handlers()
 
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown."""
+        def signal_handler(signum, frame):
+            logging.warning(f"Received signal {signum}. Initiating graceful shutdown...")
+            self.shutdown_requested = True
+        
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+    
     def _check_timeout(self):
         elapsed = time.time() - self.start_time
         if elapsed >= self.max_execution_time:
             logging.warning(f"Execution time limit reached ({elapsed:.1f}s). Stopping channel processing.")
             return True
+        if self.shutdown_requested:
+            logging.warning("Shutdown requested. Stopping channel processing.")
+            return True
         return False
+    
+    def _save_incremental(self, messages: list):
+        """Save messages incrementally to prevent data loss."""
+        if not messages:
+            return
+        
+        try:
+            glued_messages = self._glue_same_user_messages(messages)
+            if glued_messages:
+                logging.info(f"Incremental save: Inserting {len(glued_messages)} messages...")
+                self.timescale.insert_messages_batch(glued_messages)
+                self.pending_messages.clear()
+                logging.info("Incremental save completed.")
+        except Exception as e:
+            error_type = classify_error(e)
+            logging.error(f"Incremental save failed ({error_type.value}): {e}")
+            if error_type != ErrorType.FATAL:
+                # Keep messages for retry
+                self.pending_messages.extend(messages)
+            raise
 
     def _get_last_msg_ids(self):
         sql = """
@@ -262,26 +304,34 @@ class TelegramConnector:
         return sorted_glued_messages
 
     async def _process_single_channel(self, entity, entity_id, last_msg_id):
-        """Process a single channel and return its messages."""
+        """Process a single channel and return its messages with retry logic."""
         async with self.semaphore:
-            if self._check_timeout():
+            if self._check_timeout() or entity_id in self.processed_channels:
                 return []
             
             try:
-                limit_value = 20 if last_msg_id == 0 else 0
+                async def fetch_history():
+                    limit_value = 20 if last_msg_id == 0 else 0
+                    return await self.telegram(
+                        GetHistoryRequest(
+                            peer=entity,
+                            limit=limit_value,
+                            offset_id=0,
+                            offset_date=None,
+                            add_offset=0,
+                            max_id=0,
+                            min_id=last_msg_id,
+                            hash=0,
+                        )
+                    )
+                
                 logging.info(f"Obtaining chat history for '{entity_id}' - '{entity.title}'...")
                 
-                history = await self.telegram(
-                    GetHistoryRequest(
-                        peer=entity,
-                        limit=limit_value,
-                        offset_id=0,
-                        offset_date=None,
-                        add_offset=0,
-                        max_id=0,
-                        min_id=last_msg_id,
-                        hash=0,
-                    )
+                history = await retry_with_backoff(
+                    fetch_history,
+                    max_retries=3,
+                    initial_delay=1.0,
+                    max_delay=60.0
                 )
 
                 channel_messages = []
@@ -292,9 +342,15 @@ class TelegramConnector:
                     if message:
                         channel_messages.append(message)
 
+                self.processed_channels.add(entity_id)
                 return channel_messages
             except Exception as err:
-                logging.info(f"Error processing channel '{entity_id}': {str(err)}")
+                error_type = classify_error(err)
+                logging.warning(
+                    f"Error processing channel '{entity_id}' ({error_type.value}): {str(err)}"
+                )
+                if error_type == ErrorType.FATAL:
+                    self.processed_channels.add(entity_id)
                 return []
 
     async def _get_channel_messages(self):
@@ -345,41 +401,106 @@ class TelegramConnector:
 
         logging.info(f"Completed processing: {processed_count} successful, {error_count} errors")
 
-        if not channel_messages:
+        # Combine with pending messages from previous runs
+        all_messages = self.pending_messages + channel_messages
+        self.pending_messages = []
+
+        if not all_messages:
             logging.info("No messages collected from channels.")
             return
 
-        glued_messages = self._glue_same_user_messages(channel_messages)
-        logging.info(f"Found {len(channel_messages)} messages, compressed to {len(glued_messages)} messages")
+        glued_messages = self._glue_same_user_messages(all_messages)
+        logging.info(f"Found {len(all_messages)} messages, compressed to {len(glued_messages)} messages")
 
         if not glued_messages:
             logging.info("No messages to insert after gluing.")
             return
         
-        logging.info(f"Inserting {len(glued_messages)} messages into database...")
-        self.timescale.insert_messages_batch(glued_messages)
-        elapsed_time = time.time() - self.start_time
-        logging.info(f"Successfully processed {processed_count}/{len(channels_to_process)} channels in {elapsed_time:.1f}s")
-        
-        # Cleanup Telegram connection
+        # Save with retry logic
         try:
-            if self.telegram.is_connected():
-                await self.telegram.disconnect()
-                logging.info("Telegram connection closed.")
+            async def save_messages():
+                self.timescale.insert_messages_batch(glued_messages)
+            
+            await retry_with_backoff(
+                save_messages,
+                max_retries=3,
+                initial_delay=2.0,
+                max_delay=30.0,
+                error_type_filter=ErrorType.RETRYABLE
+            )
+            
+            elapsed_time = time.time() - self.start_time
+            logging.info(
+                f"Successfully processed {processed_count}/{len(channels_to_process)} "
+                f"channels in {elapsed_time:.1f}s"
+            )
         except Exception as e:
-            logging.warning(f"Error closing Telegram connection: {e}")
+            error_type = classify_error(e)
+            logging.error(f"Failed to save messages ({error_type.value}): {e}")
+            # Keep messages for next run
+            self.pending_messages = glued_messages
+            raise
 
     async def _start(self):
-        if not self.telegram.is_connected():
-            logging.info("User is not connected. Trying to connect now...")
-            await self.telegram.start()
+        telegram_connected = False
+        try:
+            if not self.telegram.is_connected():
+                logging.info("User is not connected. Trying to connect now...")
+                await retry_with_backoff(
+                    lambda: self.telegram.start(),
+                    max_retries=3,
+                    initial_delay=2.0
+                )
+                telegram_connected = True
 
-        if not await self.telegram.is_user_authorized():
-            raise UserNotLoggedIn
+            if not await self.telegram.is_user_authorized():
+                raise UserNotLoggedIn
 
-        logging.info("Getting user messages from channels...")
-        await self._get_channel_messages()
+            logging.info("Getting user messages from channels...")
+            await self._get_channel_messages()
+            
+            # Save any remaining pending messages
+            if self.pending_messages:
+                logging.info(f"Saving {len(self.pending_messages)} pending messages...")
+                self._save_incremental(self.pending_messages)
+        finally:
+            # Ensure Telegram connection is always closed
+            await self._cleanup_telegram(telegram_connected)
+
+    async def _cleanup_telegram(self, was_connected: bool):
+        """Cleanup Telegram connection with retry logic."""
+        try:
+            if self.telegram.is_connected():
+                await retry_with_backoff(
+                    lambda: self.telegram.disconnect(),
+                    max_retries=2,
+                    initial_delay=1.0,
+                    max_delay=5.0
+                )
+                logging.info("Telegram connection closed successfully.")
+        except Exception as e:
+            error_type = classify_error(e)
+            logging.warning(
+                f"Error closing Telegram connection ({error_type.value}): {e}"
+            )
 
     def start(self):
         logging.info("Starting telegram connector...")
-        self.event_loop.run_until_complete(self._start())
+        try:
+            self.event_loop.run_until_complete(self._start())
+        except KeyboardInterrupt:
+            logging.warning("Received keyboard interrupt. Initiating graceful shutdown...")
+            self.shutdown_requested = True
+            # Try to save pending messages before exit
+            if self.pending_messages:
+                try:
+                    self._save_incremental(self.pending_messages)
+                except Exception as e:
+                    logging.error(f"Failed to save messages on shutdown: {e}")
+        finally:
+            # Final cleanup
+            try:
+                if self.telegram.is_connected():
+                    self.event_loop.run_until_complete(self._cleanup_telegram(True))
+            except Exception as e:
+                logging.warning(f"Final cleanup error: {e}")
